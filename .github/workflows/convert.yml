@@ -19,13 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg coreutils pkg-config libssl-dev
-
-      - name: Install Rust and gifski
-        run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- -y
-          source $HOME/.cargo/env
-          cargo install gifski-cli
+          sudo apt-get install -y ffmpeg gifski coreutils
 
       - name: Run conversion script
         shell: bash
@@ -127,7 +121,7 @@ EOF
           fi
 
           mv -f "$PIPE_GIF" "$OUT_GIF"
-          echo "✅ Created $OUT_GIF"
+          echo "🎉 Created $OUT_GIF"
 
       - name: Upload GIF artifact
         uses: actions/upload-artifact@v4
