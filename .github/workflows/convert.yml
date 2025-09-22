@@ -19,7 +19,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg gifski coreutils
+          sudo apt-get install -y ffmpeg coreutils pkg-config libssl-dev
+
+      - name: Install Rust and gifski
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          source $HOME/.cargo/env
+          cargo install gifski-cli
 
       - name: Run conversion script
         shell: bash
@@ -33,36 +39,33 @@ jobs:
             exit 1
           fi
 
-          # Output filename
           BASE_NAME=$(basename "$IN_VIDEO")
           OUT_GIF="${BASE_NAME%.*}_4s_30fps_q100.gif"
           echo "🔧 Output GIF: $OUT_GIF"
 
-          # Parameters
           TARGET_DURATION_SEC=4.0
           FPS=30
           QUALITY=100
           SIZE_LIMIT_MB=14.5
           SIZE_LIMIT_BYTES=$(awk -v m="$SIZE_LIMIT_MB" 'BEGIN{printf "%.0f", m*1024*1024}')
 
-          # Workdir
           WORKDIR="$(pwd)/_gifski_tmp"
           FRAMES_DIR="$WORKDIR/frames"
           PIPE_GIF="$WORKDIR/test.gif"
           mkdir -p "$FRAMES_DIR"
 
-          # Probe source
-          echo "🔍 Probing video..."
+          echo "🔍 Probing video metadata..."
           read SRC_W SRC_H SRC_DUR <<EOF
-          $(ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 "$IN_VIDEO" \
-            | paste -d' ' - - -)
-          EOF
+$(ffprobe -v error -select_streams v:0 \
+  -show_entries stream=width,height \
+  -show_entries format=duration \
+  -of default=noprint_wrappers=1:nokey=1 "$IN_VIDEO" \
+  | paste -d' ' - - -)
+EOF
           echo "📊 Source W:${SRC_W} H:${SRC_H} D:${SRC_DUR}"
 
           SETPTS_FACTOR=$(awk -v t="$TARGET_DURATION_SEC" -v d="$SRC_DUR" 'BEGIN{printf "%.9f", t/d}')
+          echo "⚙️ Speed factor: $SETPTS_FACTOR"
 
           gen_frames() {
             width=$1
@@ -77,7 +80,7 @@ jobs:
           }
 
           encode_gif() {
-            out="$1"
+            out=$1
             gifski --fps "$FPS" --quality "$QUALITY" --extra -o "$out" "$FRAMES_DIR"/frame_*.png
           }
 
@@ -94,28 +97,38 @@ jobs:
           [ "$W_UPPER" -lt "$SRC_W" ] && W_UPPER=$SRC_W
           [ "$W_UPPER" -lt "$W_LOWER" ] && W_UPPER=$W_LOWER
 
-          ORIG_LO=$W_LOWER ORIG_UP=$W_UPPER BEST=0
+          ORIG_LO=$W_LOWER
+          ORIG_UP=$W_UPPER
+          BEST=0
 
           while [ "$W_LOWER" -le "$W_UPPER" ]; do
-            MID=$(( (W_LOWER+W_UPPER)/2 ))
+            MID=$(((W_LOWER+W_UPPER)/2))
             PROG=$(( (MID-ORIG_LO)*100/(ORIG_UP-ORIG_LO) ))
             echo "🔄 [$PROG%] Testing width $MID"
             gen_frames "$MID"
             encode_gif "$PIPE_GIF"
             SIZE=$(gif_size "$PIPE_GIF")
-            echo "📏 Size: $((SIZE/1024))KB"
+            echo "📏 Size: $((SIZE/1024)) KB"
             if [ "$SIZE" -le "$SIZE_LIMIT_BYTES" ]; then
               BEST=$MID
               W_LOWER=$((MID+2))
+              echo "✅ Acceptable at width $MID"
             else
               W_UPPER=$((MID-2))
+              echo "⚠️ Too large at width $MID"
             fi
           done
 
-          [ "$BEST" -eq 0 ] && BEST=16 && gen_frames "$BEST" && encode_gif "$PIPE_GIF"
-          mv -f "$PIPE_GIF" "$OUT_GIF"
+          if [ "$BEST" -eq 0 ]; then
+            BEST=16
+            echo "⚠️ No acceptable width found; defaulting to $BEST"
+            gen_frames "$BEST"
+            encode_gif "$PIPE_GIF"
+          fi
 
+          mv -f "$PIPE_GIF" "$OUT_GIF"
           echo "✅ Created $OUT_GIF"
+
       - name: Upload GIF artifact
         uses: actions/upload-artifact@v4
         with:
