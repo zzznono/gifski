@@ -1,1 +1,23 @@
-
+name: build-i686-musl
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Zig and pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zig pkg-config
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+      - name: Build static i686 musl
+        run: cargo zigbuild --release --target i686-unknown-linux-musl
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gifski-i686-musl
+          path: target/i686-unknown-linux-musl/release/gifski
