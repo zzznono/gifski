@@ -7,18 +7,11 @@ on:
         description: 'Path to input video in repo'
         required: true
         default: 'earth.MOV'
-      fps:
-        description: 'Frames per second'
-        required: false
-        default: '30'
-      width:
-        description: 'Output width'
-        required: false
-        default: '320'
 
 jobs:
   build-gif:
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v3
@@ -29,46 +22,102 @@ jobs:
           sudo apt-get install -y ffmpeg gifski coreutils
 
       - name: Run conversion script
+        shell: bash
         run: |
-          #!/bin/sh
           set -eu
 
-          # Input from workflow dispatch
           IN_VIDEO="${{ github.event.inputs.video }}"
-          FPS="${{ github.event.inputs.fps }}"
-          WIDTH="${{ github.event.inputs.width }}"
-
           echo "🎥 Input video: $IN_VIDEO"
-          [ -f "$IN_VIDEO" ] || { echo "❌ File not found: $IN_VIDEO"; exit 1; }
+          if [ ! -f "$IN_VIDEO" ]; then
+            echo "❌ File not found: $IN_VIDEO"
+            exit 1
+          fi
 
+          # Output filename
           BASE_NAME=$(basename "$IN_VIDEO")
-          OUT_GIF="${BASE_NAME%.*}_${WIDTH}px_${FPS}fps.gif"
+          OUT_GIF="${BASE_NAME%.*}_4s_30fps_q100.gif"
           echo "🔧 Output GIF: $OUT_GIF"
 
+          # Parameters
+          TARGET_DURATION_SEC=4.0
+          FPS=30
+          QUALITY=100
+          SIZE_LIMIT_MB=14.5
+          SIZE_LIMIT_BYTES=$(awk -v m="$SIZE_LIMIT_MB" 'BEGIN{printf "%.0f", m*1024*1024}')
+
+          # Workdir
           WORKDIR="$(pwd)/_gifski_tmp"
           FRAMES_DIR="$WORKDIR/frames"
-          PALETTE="$WORKDIR/palette.png"
+          PIPE_GIF="$WORKDIR/test.gif"
           mkdir -p "$FRAMES_DIR"
 
-          echo "🔍 Generating palette..."
-          ffmpeg -v error -i "$IN_VIDEO" \
-            -vf "fps=$FPS,scale=$WIDTH:-1:flags=lanczos,palettegen" \
-            -y "$PALETTE"
+          # Probe source
+          echo "🔍 Probing video..."
+          read SRC_W SRC_H SRC_DUR <<EOF
+          $(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$IN_VIDEO" \
+            | paste -d' ' - - -)
+          EOF
+          echo "📊 Source W:${SRC_W} H:${SRC_H} D:${SRC_DUR}"
 
-          echo "🎨 Encoding GIF with gifski..."
-          gifski --fps "$FPS" --quality 100 --extra -o "$OUT_GIF" \
-            "$FRAMES_DIR"/frame_*.png || \
-          {
-            echo "❌ gifski failed, falling back to ffmpeg paletteuse..."
-            ffmpeg -v error -i "$IN_VIDEO" -i "$PALETTE" \
-              -filter_complex "fps=$FPS,scale=$WIDTH:-1:flags=lanczos[x];[x][1:v]paletteuse" \
-              -y "$OUT_GIF"
+          SETPTS_FACTOR=$(awk -v t="$TARGET_DURATION_SEC" -v d="$SRC_DUR" 'BEGIN{printf "%.9f", t/d}')
+
+          gen_frames() {
+            width=$1
+            rm -f "$FRAMES_DIR"/*.png
+            height=$(awk -v w="$width" -v sw="$SRC_W" -v sh="$SRC_H" 'BEGIN{
+              h=w*sh/sw; h=int(h+0.5);
+              if(h%2==1)h++; if(h<2)h=2;
+              printf "%d",h}')
+            ffmpeg -v error -threads 0 -i "$IN_VIDEO" -an \
+              -vf "setpts=${SETPTS_FACTOR}*PTS,fps=${FPS},scale=${width}:${height}:flags=lanczos" \
+              -start_number 0 "$FRAMES_DIR/frame_%06d.png"
           }
 
-          echo "✅ Created $OUT_GIF"
+          encode_gif() {
+            out="$1"
+            gifski --fps "$FPS" --quality "$QUALITY" --extra -o "$out" "$FRAMES_DIR"/frame_*.png
+          }
 
+          gif_size() { stat -c%s "$1"; }
+
+          TOTAL_FRAMES=$(awk -v t="$TARGET_DURATION_SEC" -v f="$FPS" 'BEGIN{printf "%d", int(t*f+0.5)}')
+          [ "$TOTAL_FRAMES" -lt 1 ] && TOTAL_FRAMES=1
+
+          W_UPPER=$(awk -v S="$SIZE_LIMIT_BYTES" -v F="$TOTAL_FRAMES" -v sh="$SRC_H" -v sw="$SRC_W" 'BEGIN{
+            ratio=sh/sw; denom=0.20*F*ratio; w=sqrt(S/denom);
+            if(w<16)w=16; if(w>4096)w=4096;
+            printf "%d",int(w)}')
+          W_LOWER=16
+          [ "$W_UPPER" -lt "$SRC_W" ] && W_UPPER=$SRC_W
+          [ "$W_UPPER" -lt "$W_LOWER" ] && W_UPPER=$W_LOWER
+
+          ORIG_LO=$W_LOWER ORIG_UP=$W_UPPER BEST=0
+
+          while [ "$W_LOWER" -le "$W_UPPER" ]; do
+            MID=$(( (W_LOWER+W_UPPER)/2 ))
+            PROG=$(( (MID-ORIG_LO)*100/(ORIG_UP-ORIG_LO) ))
+            echo "🔄 [$PROG%] Testing width $MID"
+            gen_frames "$MID"
+            encode_gif "$PIPE_GIF"
+            SIZE=$(gif_size "$PIPE_GIF")
+            echo "📏 Size: $((SIZE/1024))KB"
+            if [ "$SIZE" -le "$SIZE_LIMIT_BYTES" ]; then
+              BEST=$MID
+              W_LOWER=$((MID+2))
+            else
+              W_UPPER=$((MID-2))
+            fi
+          done
+
+          [ "$BEST" -eq 0 ] && BEST=16 && gen_frames "$BEST" && encode_gif "$PIPE_GIF"
+          mv -f "$PIPE_GIF" "$OUT_GIF"
+
+          echo "✅ Created $OUT_GIF"
       - name: Upload GIF artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: gif
-          path: "*.gif"
+          path: '*.gif'
